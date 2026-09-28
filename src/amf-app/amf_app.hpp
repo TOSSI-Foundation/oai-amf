@@ -78,6 +78,13 @@ class amf_app {
       n1n2_message_subscribe;
   mutable std::shared_mutex m_n1n2_message_subscribe;
 
+  // LCS correlation ID of each N1 LPP transfer -> (SUPI, NF instance ID of the LMF that sent it). An uplink
+  // LPP message is routed back by the correlation ID the UE echoes in Additional information
+  // (TS 24.501 5.4.5.2.3 c, TS 23.273 6.11.1 step 7).
+  // ponytail: entries are never removed; bounded by the number of LPP sessions, add expiry if that grows.
+  std::map<std::string, std::pair<std::string, std::string>> lpp_routes;
+  mutable std::shared_mutex m_lpp_routes;
+
   std::map<
       n1n2sub_id_t,
       std::shared_ptr<oai::_3gpp::model::NonUeN2InfoSubscriptionCreateData>>
@@ -685,6 +692,25 @@ class amf_app {
    * subscriptions: list of subscriptions matched
    * @return void
    */
+  /*
+   * Whether the UE indicated "LPP in N1 mode supported" at registration (5GMM capability octet 3 bit 3,
+   * TS 24.501 9.11.3.1); nullopt for a UE this AMF has no context for
+   */
+  std::optional<bool> ue_supports_lpp(const std::string& supi) const;
+
+  /*
+   * Remember which LMF sent an N1 LPP message under an LCS correlation ID (TS 24.501 5.4.5.3.2 c)
+   */
+  void add_lpp_route(
+      const std::string& lcs_correlation_id, const std::string& supi,
+      const std::string& lmf_nf_id);
+
+  /*
+   * The (SUPI, LMF NF instance ID) an LCS correlation ID was issued for, if any
+   */
+  std::optional<std::pair<std::string, std::string>> find_lpp_route(
+      const std::string& lcs_correlation_id) const;
+
   void find_n1n2_info_subscriptions(
       const std::string& ue_ctx_id,
       std::optional<

@@ -2137,6 +2137,8 @@ bool amf_sbi::send_http_request(
   // Send the request and get the response
   auto http_response = http_client_inst->send_http_request(
       oai::common::sbi::method_e::POST, http_request);
+  // The caller's response_code was never set, so every caller read 0 whatever the peer answered.
+  response_code = http_response.status_code;
 
   if (http_response.status_code ==
       oai::common::sbi::http_status_code::NO_RESPONSE) {
@@ -2183,6 +2185,11 @@ bool amf_sbi::send_http_request(
        oai::common::sbi::http_status_code::NO_CONTENT)) {
     // TODO:
 
+  } else if (
+      http_response.status_code ==
+          oai::common::sbi::http_status_code::NO_CONTENT &&
+      json_data_response.empty()) {
+    // 204 carries no body by definition (e.g. N1MessageNotify, TS 29.518 6.1.5.4.3.1): success, nothing to parse.
   } else {  // Response with success code
     try {
       response_data = nlohmann::json::parse(json_data_response);

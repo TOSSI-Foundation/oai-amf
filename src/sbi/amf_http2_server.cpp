@@ -1261,16 +1261,60 @@ void amf_http2_server::n1_n2_message_transfer_handler(
             "amf_server", "Received N1 LPP", (uint8_t*) bdata(n1lpp),
             blength(n1lpp));
 
+        // The DL NAS TRANSPORT must carry the LCS correlation identifier in Additional information
+        // (TS 24.501 5.4.5.3.2 c, 8.2.11.3), and the UE's answer can only be routed back to the LMF
+        // through it (5.4.5.2.3 c, TS 23.273 6.11.1 steps 3/6/7). Without it the transfer cannot be
+        // completed in a compliant way, so refuse it rather than send an unroutable DL message.
+        const auto& n1_container = n1N2MessageTransferReqData.getN1MessageContainer();
+        if (!n1N2MessageTransferReqData.lcsCorrelationIdIsSet() ||
+            n1N2MessageTransferReqData.getLcsCorrelationId().empty() ||
+            !n1_container.nfIdIsSet()) {
+          // nfId is mandatory for n1MessageClass LPP, TS 29.518 6.1.6.2.17.
+          Logger::amf_server().warn(
+              "N1 LPP transfer without lcsCorrelationId or n1MessageContainer.nfId, rejected");
+          nlohmann::json json_data       = {};
+          ProblemDetails problem_details = {};
+          problem_details.setCause("MANDATORY_IE_MISSING");
+          to_json(json_data, problem_details);
+          res.write_head(oai::common::sbi::http_status_code::BAD_REQUEST);
+          res.end(json_data.dump().c_str());
+          return;
+        }
+
+        // 403 UE_WITHOUT_N1_LPP_SUPPORT when the UE did not indicate "LPP in N1 mode supported"
+        // (5GMM capability octet 3 bit 3, TS 24.501 9.11.3.1) - TS 29.518 5.2.2.3.1.2.
+        const auto lpp_supported = m_amf_app->ue_supports_lpp(supi);
+        if (!lpp_supported.has_value()) {
+          // No context for the UE: 404 CONTEXT_NOT_FOUND (TS 29.518 Table 6.1.3.5.3.1-3).
+          nlohmann::json json_data       = {};
+          ProblemDetails problem_details = {};
+          problem_details.setCause("CONTEXT_NOT_FOUND");
+          to_json(json_data, problem_details);
+          res.write_head(oai::common::sbi::http_status_code::NOT_FOUND);
+          res.end(json_data.dump().c_str());
+          return;
+        }
+        if (!lpp_supported.value()) {
+          Logger::amf_server().warn(
+              "N1 LPP transfer for %s: UE did not indicate LPP in N1 mode", supi.c_str());
+          nlohmann::json json_data       = {};
+          ProblemDetails problem_details = {};
+          problem_details.setCause("UE_WITHOUT_N1_LPP_SUPPORT");
+          to_json(json_data, problem_details);
+          res.write_head(oai::common::sbi::http_status_code::FORBIDDEN);
+          res.end(json_data.dump().c_str());
+          return;
+        }
+
         itti_msg->n1lpp        = bstrcpy(n1lpp);
         itti_msg->is_n1lpp_set = true;
-
-        if (n1N2MessageTransferReqData.lcsCorrelationIdIsSet()) {
-          itti_msg->lcs_correlation_id = std::make_optional<std::string>(
-              n1N2MessageTransferReqData.getLcsCorrelationId());
-          Logger::amf_server().debug(
-              "LCS Correlation ID: %s",
-              n1N2MessageTransferReqData.getLcsCorrelationId().c_str());
-        }
+        itti_msg->lcs_correlation_id =
+            std::make_optional<std::string>(n1N2MessageTransferReqData.getLcsCorrelationId());
+        itti_msg->lmf_nf_id = std::make_optional<std::string>(n1_container.getNfId());
+        Logger::amf_server().debug(
+            "N1 LPP: LCS Correlation ID %s from LMF %s",
+            n1N2MessageTransferReqData.getLcsCorrelationId().c_str(),
+            n1_container.getNfId().c_str());
 
       } break;
 

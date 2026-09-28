@@ -600,11 +600,19 @@ void amf_app::handle_itti_message(
     dl->SetPayloadContainerType(kLtePositioningProtocol);
     dl->SetPayloadContainer(
         (uint8_t*) bdata(bstrcpy(itti_msg.n1lpp)), blength(itti_msg.n1lpp));
+    // Additional information = the LCS correlation identifier received from the LMF (TS 24.501 5.4.5.3.2 c),
+    // as its own octets: the value coding is left to the LCS application (9.11.2.1), and the UL side
+    // reverses exactly this. The HTTP server has already refused a transfer without one.
     if (itti_msg.lcs_correlation_id.has_value()) {
       bstring lcs_correlation_id = nullptr;
       amf_conv::msg_str_2_msg_hex(
           itti_msg.lcs_correlation_id.value(), lcs_correlation_id);
       dl->SetAdditionalInformation(lcs_correlation_id);
+      if (itti_msg.lmf_nf_id.has_value()) {
+        add_lpp_route(
+            itti_msg.lcs_correlation_id.value(), itti_msg.supi,
+            itti_msg.lmf_nf_id.value());
+      }
     }
 
     uint8_t nas[BUFFER_SIZE_1024];
@@ -2416,6 +2424,31 @@ bool amf_app::remove_n1n2_message_subscription(
 }
 
 //---------------------------------------------------------------------------------------------
+std::optional<bool> amf_app::ue_supports_lpp(const std::string& supi) const {
+  std::shared_ptr<nas_context> nc = nullptr;
+  constexpr uint8_t k5gmmCapabilityLpp = 0x04;
+  if (!amf_n1_inst->supi_2_nas_context(supi, nc) || !nc) return std::nullopt;
+  return (nc->_5gmm_capability[0] & k5gmmCapabilityLpp) != 0;
+}
+
+//----------------------------------------------------------------------------------------
+void amf_app::add_lpp_route(
+    const std::string& lcs_correlation_id, const std::string& supi,
+    const std::string& lmf_nf_id) {
+  std::unique_lock lock(m_lpp_routes);
+  lpp_routes[lcs_correlation_id] = {supi, lmf_nf_id};
+}
+
+//----------------------------------------------------------------------------------------
+std::optional<std::pair<std::string, std::string>> amf_app::find_lpp_route(
+    const std::string& lcs_correlation_id) const {
+  std::shared_lock lock(m_lpp_routes);
+  auto it = lpp_routes.find(lcs_correlation_id);
+  if (it == lpp_routes.end()) return std::nullopt;
+  return it->second;
+}
+
+//----------------------------------------------------------------------------------------
 void amf_app::find_n1n2_info_subscriptions(
     const std::string& ue_ctx_id,
     std::optional<

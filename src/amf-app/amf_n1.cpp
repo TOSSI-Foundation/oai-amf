@@ -35,6 +35,9 @@
 #include "ServiceRequest.hpp"
 #include "UEAuthenticationCtx.h"
 #include "UlNasTransport.hpp"
+#include "mime_parser.hpp"
+#include "PlmnIdNid.h"
+#include "Guami.h"
 #include "amf_app.hpp"
 #include "amf_config.hpp"
 #include "amf_conversions.hpp"
@@ -2245,11 +2248,15 @@ bool amf_n1::registration_request_handle(
 
   // Get 5GMM Capability IE (optional), not
   // included for periodic registration updating procedure
+  // Only overwrite when the IE is present: a periodic registration omits it, and zeroing octet 3 there
+  // would, among others, silently drop "LPP in N1 mode supported" (TS 24.501 9.11.3.1), which the
+  // N1N2MessageTransfer LPP check relies on (TS 29.518 5.2.2.3.1.2).
   uint8_t _5g_mm_cap = 0;
   if (!registration_request->Get5gmmCapability(_5g_mm_cap)) {
     Logger::amf_n1().warn("No Optional IE 5GMMCapability available");
+  } else {
+    nc->_5gmm_capability[0] = _5g_mm_cap;
   }
-  nc->_5gmm_capability[0] = _5g_mm_cap;
 
   // Extract Release 17 capability bits from the full IE (octet 7).
   nc->nas_ue_supports_nssrg                = false;
@@ -3772,6 +3779,26 @@ bool amf_n1::security_mode_complete_handle(
         Logger::amf_n1().debug("Optional IE RequestedNssai is not present");
       }
 
+      // 5GMM capability is not a cleartext IE (TS 24.501 4.4.6), so a UE sends it only here, in the complete
+      // REGISTRATION REQUEST inside the NAS message container. Without this the AMF never learns, among
+      // others, "LPP in N1 mode supported" (9.11.3.1), and refuses every LMF with UE_WITHOUT_N1_LPP_SUPPORT
+      // (TS 29.518 5.2.2.3.1.2).
+      uint8_t _5g_mm_cap = 0;
+      if (registration_request->Get5gmmCapability(_5g_mm_cap)) {
+        nc->_5gmm_capability[0] = _5g_mm_cap;
+        auto cap_ie             = registration_request->Get5gmmCapabilityIe();
+        if (cap_ie.has_value()) {
+          nc->nas_ue_supports_nssrg = cap_ie.value().SupportsNssrg();
+          nc->nas_ue_supports_nsag  = cap_ie.value().SupportsNsag();
+          nc->nas_ue_supports_uas   = cap_ie.value().SupportsUas();
+          nc->nas_ue_supports_mps_indicator_update =
+              cap_ie.value().SupportsMpsIndicatorUpdate();
+        }
+        Logger::amf_n1().debug(
+            "5GMM capability from NAS message container, octet 3 0x%x",
+            _5g_mm_cap);
+      }
+
       // Get Uplink Data Status
       uplink_data_status_opt = registration_request->GetUplinkDataStatus();
       if (!uplink_data_status_opt.has_value())
@@ -4995,34 +5022,117 @@ void amf_n1::ul_nas_transport_handle(
 
       } break;
       case kLtePositioningProtocol: {
-        // Get payload container
+        // Uplink LPP: TS 24.501 5.4.5.2.3 c / 5.4.5.2.5 c, TS 23.273 6.11.1 steps 6-7,
+        // TS 29.518 5.2.2.3.5 (N1MessageNotify).
         ul_nas->GetPayloadContainer(lpp_msg);
 
-        uint32_t response_code  = 0;
-        nlohmann::json LPP_JSON = {};
-        std::string n1_msg      = {};
-        std::string n2_msg      = {};
-        std::string url         = {};
-
-        // TODO: remove hardcoded values
-        LPP_JSON["n1NotifySubscriptionId"]               = "1";
-        LPP_JSON["n1MessageContainer"]["n1MessageClass"] = "LPP";
-        LPP_JSON["n1MessageContainer"]["n1MessageContent"]["contentId"] =
-            "n1Msg";
-        std::string json_part = LPP_JSON.dump();
-        uint8_t http_version  = 1;
-
-        url = amf_cfg->lmf_addr.uri_root + "/nlmf/notifyN1";
-
-        amf_conv::octet_stream_2_hex_stream_bis(
-            (uint8_t*) bdata(lpp_msg), blength(lpp_msg), n1_msg);
-
-        amf_sbi_inst->send_http_request(
-            url, json_part, n1_msg, n2_msg, http_version, response_code);
-        if (response_code == 204) {
-          Logger::amf_n1().debug("Sent notification successfully! LPP");
+        // The routing information is the LCS correlation ID the AMF put in the DL NAS TRANSPORT, echoed by
+        // the UE as the same octets (TS 23.273 6.17.1 NOTE 1: same identifier). No Additional information,
+        // or none this AMF issued: abort (TS 24.501 5.4.5.2.5 c 1 and 2).
+        bstring routing_info = nullptr;
+        if (!ul_nas->GetAdditionalInformation(routing_info) ||
+            blength(routing_info) == 0) {
+          Logger::amf_n1().warn(
+              "UL NAS TRANSPORT (LPP) without Additional information, aborted");
+          break;
+        }
+        const std::string lcs_correlation_id(
+            (const char*) bdata(routing_info), blength(routing_info));
+        const auto route = amf_app_inst->find_lpp_route(lcs_correlation_id);
+        if (!route.has_value()) {
+          Logger::amf_n1().warn(
+              "UL NAS TRANSPORT (LPP): no LMF associated with routing information "
+              "%s, aborted",
+              lcs_correlation_id.c_str());
+          break;
+        }
+        const auto& [supi, lmf_nf_id] = route.value();
+        std::shared_ptr<nas_context> nc = {};
+        if (!amf_ue_id_2_nas_context(amf_ue_ngap_id, nc) || nc->supi != supi) {
+          Logger::amf_n1().warn(
+              "UL NAS TRANSPORT (LPP): routing information %s belongs to another "
+              "UE, aborted",
+              lcs_correlation_id.c_str());
+          break;
         }
 
+        // The LMF's own N1 LPP subscription gives the callback (TS 29.518 5.2.2.3.3). Match on nfId: the
+        // generic lookup compares N1 message classes even on subscriptions that set none.
+        std::optional<N1MessageClass_anyOf::eN1MessageClass_anyOf> n1_class =
+            N1MessageClass_anyOf::eN1MessageClass_anyOf::LPP;
+        std::optional<N2InformationClass_anyOf::eN2InformationClass_anyOf>
+            n2_class = std::nullopt;
+        std::map<
+            n1n2sub_id_t,
+            std::shared_ptr<oai::_3gpp::model::UeN1N2InfoSubscriptionCreateData>>
+            subscriptions = {};
+        amf_app_inst->find_n1n2_info_subscriptions(
+            supi, n1_class, n2_class, subscriptions);
+        std::optional<std::pair<n1n2sub_id_t, std::string>> target =
+            std::nullopt;
+        for (const auto& [sub_id, sub] : subscriptions) {
+          if (sub->n1MessageClassIsSet() && sub->n1NotifyCallbackUriIsSet() &&
+              sub->nfIdIsSet() && sub->getNfId() == lmf_nf_id) {
+            target = std::make_pair(sub_id, sub->getN1NotifyCallbackUri());
+            break;
+          }
+        }
+        if (!target.has_value()) {
+          // ponytail: the NRF default-notification fallback (TS 29.518 5.2.2.3.5.3 step 1) is not
+          // implemented; the LMF has to subscribe. Add it if an LMF relies on its NF profile instead.
+          Logger::amf_n1().warn(
+              "UL NAS TRANSPORT (LPP): LMF %s has no N1 LPP subscription for %s, "
+              "aborted",
+              lmf_nf_id.c_str(), supi.c_str());
+          break;
+        }
+
+        // N1MessageNotification, TS 29.518 6.1.6.2.16. contentId must equal the Content-Id the multipart
+        // builder writes for an N1 part (6.1.2.4), so it references that constant rather than a literal.
+        nlohmann::json notification = {};
+        notification["n1NotifySubscriptionId"] = std::to_string(target->first);
+        notification["n1MessageContainer"]["n1MessageClass"] = "LPP";
+        notification["n1MessageContainer"]["n1MessageContent"]["contentId"] =
+            oai::utils::N1_SM_CONTENT_ID;
+        // nfId "shall be present" for class LPP (6.1.6.2.17); the text is written for the downlink, so for
+        // the uplink this carries the LMF the LPP session belongs to.
+        notification["n1MessageContainer"]["nfId"] = lmf_nf_id;
+        // Required for LPP by 5.2.2.3.5.3 step 2 and TS 23.273 6.11.1 step 7 (the table says O).
+        notification["lcsCorrelationId"] = lcs_correlation_id;
+        // "shall be present during UE Assisted and UE Based Positioning Procedure" (6.1.6.2.16).
+        oai::_3gpp::model::Guami guami           = {};
+        oai::_3gpp::model::PlmnIdNid plmn_id_nid = {};
+        std::string amf_id                       = {};
+        amf_conv::get_amf_id(
+            amf_cfg->guami.region_id, amf_cfg->guami.amf_set_id,
+            amf_cfg->guami.amf_pointer, amf_id);
+        guami.setAmfId(amf_id);
+        plmn_id_nid.setMcc(amf_cfg->guami.mcc);
+        plmn_id_nid.setMnc(amf_cfg->guami.mnc);
+        guami.setPlmnId(plmn_id_nid);
+        nlohmann::json guami_json = {};
+        to_json(guami_json, guami);
+        notification["guami"] = guami_json;
+
+        std::string json_part = notification.dump();
+        std::string n1_msg    = {};
+        std::string n2_msg    = {};
+        std::string url       = target->second;
+        uint32_t response_code = 0;
+        amf_conv::octet_stream_2_hex_stream_bis(
+            (uint8_t*) bdata(lpp_msg), blength(lpp_msg), n1_msg);
+        amf_sbi_inst->send_http_request(
+            url, json_part, n1_msg, n2_msg, 2, response_code);
+        // The LMF answers 204 No Content (TS 29.518 6.1.5.4.3.1).
+        if (response_code == 204) {
+          Logger::amf_n1().info(
+              "N1MessageNotify (LPP) to %s, correlation ID %s: delivered",
+              url.c_str(), lcs_correlation_id.c_str());
+        } else {
+          Logger::amf_n1().warn(
+              "N1MessageNotify (LPP) to %s answered %u", url.c_str(),
+              response_code);
+        }
       } break;
 
       default: {

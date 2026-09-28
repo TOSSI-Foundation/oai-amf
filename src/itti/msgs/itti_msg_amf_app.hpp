@@ -81,6 +81,7 @@ class itti_n1n2_message_transfer_request : public itti_msg_amf_app {
     pdu_session_id     = 0;
     ppi                = 0;
     lcs_correlation_id = std::nullopt;
+    lmf_nf_id          = std::nullopt;
   }
   itti_n1n2_message_transfer_request(
       const itti_n1n2_message_transfer_request&) = delete;
@@ -101,6 +102,8 @@ class itti_n1n2_message_transfer_request : public itti_msg_amf_app {
   uint8_t ppi;
   // other parameters
   std::optional<std::string> lcs_correlation_id;
+  // n1MessageContainer.nfId of an LPP transfer: the LMF that sent it, TS 29.518 6.1.6.2.17.
+  std::optional<std::string> lmf_nf_id;
 };
 
 class itti_non_ue_n2_message_transfer_request : public itti_msg_amf_app {
