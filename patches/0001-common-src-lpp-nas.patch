@@ -1,0 +1,66 @@
+From 48fe72cc87fa0ce09a620d40e1c202b0af3c6124 Mon Sep 17 00:00:00 2001
+From: kriish <kriish@coranlabs.com>
+Date: Mon, 28 Sep 2026 08:08:08 +0000
+Subject: [PATCH] nas: carry the LPP payload and its additional information on
+ UL NAS transport
+
+The UE's LPP messages reach the AMF in an UL NAS TRANSPORT whose payload container type is LPP; without this the container and its LCS correlation identifier are dropped before the AMF can route them.
+---
+ nas/5gmm-msgs/UlNasTransport.cpp  | 10 ++++++++++
+ nas/5gmm-msgs/UlNasTransport.hpp  |  2 +-
+ nas/ies/AdditionalInformation.cpp |  5 ++++-
+ 3 files changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/nas/5gmm-msgs/UlNasTransport.cpp b/nas/5gmm-msgs/UlNasTransport.cpp
+index bd9a1f6a..c6689e6f 100644
+--- a/nas/5gmm-msgs/UlNasTransport.cpp
++++ b/nas/5gmm-msgs/UlNasTransport.cpp
+@@ -166,6 +166,16 @@ void UlNasTransport::SetAdditionalInformation(const bstring& value) {
+   ie_additional_information_ = std::make_optional<AdditionalInformation>(value);
+ }
+ 
++//------------------------------------------------------------------------------
++bool UlNasTransport::GetAdditionalInformation(bstring& value) const {
++  if (ie_additional_information_.has_value()) {
++    ie_additional_information_.value().GetValue(value);
++    return true;
++  } else {
++    return false;
++  }
++}
++
+ //------------------------------------------------------------------------------
+ void UlNasTransport::SetMaPduSessionInformation(uint8_t value) {
+   ie_ma_pdu_session_information_ =
+diff --git a/nas/5gmm-msgs/UlNasTransport.hpp b/nas/5gmm-msgs/UlNasTransport.hpp
+index df19a3d2..ca5aae18 100644
+--- a/nas/5gmm-msgs/UlNasTransport.hpp
++++ b/nas/5gmm-msgs/UlNasTransport.hpp
+@@ -45,7 +45,7 @@ class UlNasTransport : public Nas5gmmMessage {
+   bool GetDnn(bstring& dnn) const;
+ 
+   void SetAdditionalInformation(const bstring& value);
+-  // TODO: Get
++  bool GetAdditionalInformation(bstring& value) const;
+ 
+   void SetMaPduSessionInformation(uint8_t value);
+   // TODO: Get
+diff --git a/nas/ies/AdditionalInformation.cpp b/nas/ies/AdditionalInformation.cpp
+index 486c2c7d..8614d8d0 100644
+--- a/nas/ies/AdditionalInformation.cpp
++++ b/nas/ies/AdditionalInformation.cpp
+@@ -13,7 +13,10 @@ AdditionalInformation::AdditionalInformation()
+ }
+ 
+ //------------------------------------------------------------------------------
+-AdditionalInformation::AdditionalInformation(const bstring& value) {
++AdditionalInformation::AdditionalInformation(const bstring& value)
++    : Type4NasIe(kIeiAdditionalInformation) {
++  // The IEI must be set here as in the default constructor: without it the IE is encoded as bare
++  // length+value, and the receiver cannot find Additional information (IEI 0x24, TS 24.501 8.2.10/8.2.11).
+   value_ = bstrcpy(value);
+   SetLengthIndicator(
+       (blength(value) > kAdditionalInformationContentMinimumLength) ?
+-- 
+2.34.1
+
